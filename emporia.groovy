@@ -2,10 +2,10 @@ import groovy.json.*
 
 metadata {
     definition(
-        name: "Emporia Vue Driver 2.x",
+        name: "Emporia Vue Driver 2.4.x",
         namespace: "ke7lvb",
         author: "Ryan Lundell",
-        importUrl: "https://raw.githubusercontent.com/ke7lvb/Emporia-Vue-Hubitat/refs/heads/main/emporia.groovy",
+        importUrl: "https://raw.githubusercontent.com/SebastienViel/Emporia-Vue-Hubitat/refs/heads/main/emporia.groovy",
     ){
         capability "Refresh"
         capability "PowerSource"
