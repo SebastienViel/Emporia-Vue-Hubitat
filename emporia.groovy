@@ -17,7 +17,7 @@ metadata {
         command "generateToken"
         command "refreshToken"
         command "resetEnergy", [[name: "confirm", type: "ENUM", constraints: ["I understand this will reset all cumulative energy totals"], description: "Select to confirm reset"]]
-        command "migrateChildDevices"
+        command "migrateChildDevices", [[name: "forceDeleteDuplicates", type: "ENUM", constraints: ["No - skip if stable ID already exists", "Yes - delete old device if stable ID already exists"], description: "What to do if a migrated device already exists"]]
 
         attribute "lastUpdate", "string"
         attribute "tokenExpiry", "string"
@@ -46,7 +46,7 @@ metadata {
     }
 }
 
-def version() { return "2.4.5" }
+def version() { return "2.4.6" }
 
 def installed() {
     if (logEnable) log.info "Driver installed"
@@ -103,7 +103,7 @@ def updated() {
 // since they already use stable fixed names as their network IDs.
 // Run this command once after upgrading to v2.4.5.
 // ---------------------------------------------------------------------------
-def migrateChildDevices() {
+def migrateChildDevices(forceDeleteDuplicates) {
     if (logEnable) log.info "Starting child device migration to stable network IDs"
 
     def host = "https://api.emporiaenergy.com/"
@@ -159,11 +159,17 @@ def migrateChildDevices() {
                 // Preserve cumulative energy before migration
                 def savedEnergy = cd.getDataValue("cumulativeEnergy") ?: "0"
 
-                // Check if a device with the new ID already exists (avoid duplicates)
+                // Check if a device with the new ID already exists
                 def existing = getChildDevice(newNetId)
                 if (existing) {
-                    log.warn "Device with new ID ${newNetId} already exists — skipping migration of ${oldNetId}"
-                    skipped++
+                    if (forceDeleteDuplicates == "Yes - delete old device if stable ID already exists") {
+                        log.warn "Device with new ID ${newNetId} already exists — force-deleting old device: ${oldNetId}"
+                        deleteChildDevice(oldNetId)
+                        skipped++
+                    } else {
+                        log.warn "Device with new ID ${newNetId} already exists — skipping migration of ${oldNetId} (use forceDeleteDuplicates=Yes to remove it)"
+                        skipped++
+                    }
                     return
                 }
 
