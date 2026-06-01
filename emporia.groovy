@@ -16,6 +16,7 @@ metadata {
         command "getDeviceGid"
         command "generateToken"
         command "refreshToken"
+        command "resetEnergy", [[name: "confirm", type: "ENUM", constraints: ["I understand this will reset all cumulative energy totals"], description: "Select to confirm reset"]]
 
         attribute "lastUpdate", "string"
         attribute "tokenExpiry", "string"
@@ -27,7 +28,7 @@ metadata {
         input name: "email", type: "string", title: "Emporia Email", required: true
         input name: "password", type: "password", title: "Emporia Password", required: true
         input("scale", "enum", title: "Scale", options: ["1S", "1MIN", "1H", "1D", "1W", "1Mon", "1Y"], required: true, defaultValue: "1H")
-        input("energyUnit", "enum", title: "Energy Unit", options: ["KilowattHours"/*, "Dollars", "AmpHours", "Trees", "GallonsOfGas", "MilesDriven", "Carbon"*/], required: true, defaultValue: "KilowattHours")
+        input("energyUnit", "enum", title: "Energy Unit", options: ["KilowattHours"], required: true, defaultValue: "KilowattHours")
         input("refresh_interval", "enum", title: "How often to refresh the Emporia data", options: [
             0: "Do NOT update",
             1: "1 Minute",
@@ -39,21 +40,24 @@ metadata {
             45: "45 Minutes",
             60: "1 Hour"
         ], required: true, defaultValue: "60")
+        input name: "resetDaily", type: "bool", title: "Reset cumulative energy totals daily at midnight", defaultValue: false
+        input name: "solarChannelName", type: "string", title: "Solar Channel Name (must match Emporia app exactly)", defaultValue: "Rooftop Solar Panels"
     }
 }
 
-def version() { return "2.4.2" }
+def version() { return "2.4.4" }
 
 def installed() {
     if (logEnable) log.info "Driver installed"
     state.version = version()
     state.deviceGID = []
     state.deviceNames = []
+    state.cumulativeEnergy = 0
 }
 
 def uninstalled() {
     unschedule()
-    if(logEnable) log.info "Driver uninstalled"
+    if (logEnable) log.info "Driver uninstalled"
 }
 
 def updated() {
@@ -70,9 +74,17 @@ def updated() {
         unschedule(refresh)
     }
 
-    // Schedule token refresh
+    // Schedule daily reset if enabled
+    if (settings.resetDaily) {
+        schedule("0 0 0 * * ?", resetEnergyInternal, [overwrite: true])
+        if (logEnable) log.info "Daily energy reset scheduled at midnight"
+    } else {
+        unschedule(resetEnergyInternal)
+    }
+
+    // Schedule token refresh 5 minutes before expiry
     if (state.tokenExpiry) {
-        def refreshTime = (state.tokenExpiry - now() - 300000) / 1000 // Refresh 5 minutes before expiry
+        def refreshTime = (state.tokenExpiry - now() - 300000) / 1000
         runIn(refreshTime.toInteger(), refreshToken)
         if (logEnable) log.info "Token refresh scheduled in ${refreshTime.toInteger()} seconds"
     }
@@ -81,6 +93,25 @@ def updated() {
     if (!jsonState) {
         state.remove("JSON")
     }
+}
+
+def resetEnergy(confirm) {
+    if (confirm == "I understand this will reset all cumulative energy totals") {
+        resetEnergyInternal()
+    } else {
+        log.warn "Energy reset not confirmed. No action taken."
+    }
+}
+
+def resetEnergyInternal() {
+    if (logEnable) log.info "Resetting all cumulative energy totals"
+    state.cumulativeEnergy = 0
+    sendEvent(name: "energy", value: 0)
+    getChildDevices().each { cd ->
+        cd.sendEvent(name: "energy", value: 0)
+        cd.updateDataValue("cumulativeEnergy", "0")
+    }
+    if (logEnable) log.info "All cumulative energy totals reset to 0"
 }
 
 def generateToken() {
@@ -109,8 +140,8 @@ def generateToken() {
                     state.refreshToken = responseData.AuthenticationResult.RefreshToken
                     state.tokenExpiry = now() + (responseData.AuthenticationResult.ExpiresIn * 1000)
                     sendEvent(name: "tokenExpiry", value: new Date(state.tokenExpiry).format("yyyy-MM-dd'T'HH:mm:ss'Z'"))
-                    if (logEnable) log.info "Token generated successfully. ID Token: ${state.idToken}"
-                    updated() // Trigger updated to schedule refresh
+                    if (logEnable) log.info "Token generated successfully."
+                    updated()
                 } else {
                     log.error "AuthenticationResult missing in response. Response: ${responseData}"
                 }
@@ -148,8 +179,8 @@ def refreshToken() {
                     state.accessToken = responseData.AuthenticationResult.AccessToken
                     state.tokenExpiry = now() + (responseData.AuthenticationResult.ExpiresIn * 1000)
                     sendEvent(name: "tokenExpiry", value: new Date(state.tokenExpiry).format("yyyy-MM-dd'T'HH:mm:ss'Z'"))
-                    if (logEnable) log.info "Token refreshed successfully. New ID Token: ${state.idToken}"
-                    updated() // Trigger updated to reschedule refresh
+                    if (logEnable) log.info "Token refreshed successfully."
+                    updated()
                 } else {
                     log.error "AuthenticationResult missing in refresh response. Response: ${responseData}"
                 }
@@ -174,14 +205,19 @@ def getDeviceGid() {
         response.devices.each { value ->
             if (debugLog) log.debug value.deviceGid
             deviceGID.add(value.deviceGid)
-            value.devices[0].channels.each { next_value ->
-                deviceNames.add(next_value.name)
+            if (value.devices && value.devices.size() > 0) {
+                value.devices[0].channels.each { next_value ->
+                    deviceNames.add(next_value.name)
+                }
             }
         }
+        if (logEnable) log.info "Saving deviceGID: ${deviceGID}"
+        if (logEnable) log.info "Saving deviceNames: ${deviceNames}"
         state.deviceGID = deviceGID
         state.deviceNames = deviceNames - null - ''
     } catch (e) {
         log.error "Error fetching device GID: ${e.message}"
+        log.error "Error details: ${e}"
     }
 }
 
@@ -201,29 +237,82 @@ def refresh() {
             }
             def devices = JSON.deviceListUsages.devices
             def combinedTotals = 0
+
+            // --- First pass: collect TotalUsage and Solar to compute grid flow ---
+            def totalUsageWh = 0
+            def solarWh = 0
+            def solarName = settings.solarChannelName ?: "Rooftop Solar Panels"
+
+            devices.each { value ->
+                value.channelUsages.each { next_value ->
+                    def name = next_value.name
+                    def usage = next_value.usage ?: 0
+                    def Wh = convertToWh(usage)
+                    if (name == "TotalUsage") { totalUsageWh += Wh }
+                    if (name == solarName) { solarWh += Wh }
+                }
+            }
+
+            // Solar is positive when producing energy.
+            // MainsFromGrid = energy drawn from grid  = max(0, TotalUsage - Solar)
+            // MainsToGrid   = energy exported to grid = max(0, Solar - TotalUsage)
+            def mainsFromGridWh = Math.max(0, totalUsageWh - solarWh)
+            def mainsToGridWh   = Math.max(0, solarWh - totalUsageWh)
+
+            if (debugLog) log.debug "TotalUsage: ${totalUsageWh} Wh | Solar: ${solarWh} Wh | FromGrid: ${mainsFromGridWh} Wh | ToGrid: ${mainsToGridWh} Wh"
+
+            // Update MainsFromGrid child
+            def cdFromGrid = fetchChild("MainsFromGrid")
+            cdFromGrid.sendEvent(name: "power", value: mainsFromGridWh)
+            def existingFromGrid = (cdFromGrid.getDataValue("cumulativeEnergy") ?: "0").toBigDecimal()
+            def newFromGrid = existingFromGrid + (mainsFromGridWh / 1000)
+            cdFromGrid.updateDataValue("cumulativeEnergy", newFromGrid.toString())
+            cdFromGrid.sendEvent(name: "energy", value: newFromGrid.setScale(6, BigDecimal.ROUND_HALF_UP))
+
+            // Update MainsToGrid child
+            def cdToGrid = fetchChild("MainsToGrid")
+            cdToGrid.sendEvent(name: "power", value: mainsToGridWh)
+            def existingToGrid = (cdToGrid.getDataValue("cumulativeEnergy") ?: "0").toBigDecimal()
+            def newToGrid = existingToGrid + (mainsToGridWh / 1000)
+            cdToGrid.updateDataValue("cumulativeEnergy", newToGrid.toString())
+            cdToGrid.sendEvent(name: "energy", value: newToGrid.setScale(6, BigDecimal.ROUND_HALF_UP))
+
+            // --- Second pass: update all channel child devices ---
             devices.each { value ->
                 value.channelUsages.each { next_value ->
                     if (debugLog) log.debug next_value
                     def name = next_value.name
                     def usage = next_value.usage ?: 0
                     def Wh = convertToWh(usage)
+                    def kWh = Wh / 1000
+
                     if (name == "Main") {
                         combinedTotals += Wh
                     }
-                    
-                    if(name == "Main" || name == "TotalUsage" || name == "Balance"){
-                    	def Gid = next_value.deviceGid
-                    	name = name+"_"+Gid
-                	}
-                    
+
+                    if (name == "Main" || name == "TotalUsage" || name == "Balance") {
+                        def Gid = next_value.deviceGid
+                        name = name + "_" + Gid
+                    }
+
                     def cd = fetchChild(name)
                     cd.sendEvent(name: "power", value: Wh)
-                    cd.sendEvent(name: "energy", value: (Wh / 1000))
+
+                    def existingEnergy = (cd.getDataValue("cumulativeEnergy") ?: "0").toBigDecimal()
+                    def newEnergy = existingEnergy + kWh
+                    cd.updateDataValue("cumulativeEnergy", newEnergy.toString())
+                    cd.sendEvent(name: "energy", value: newEnergy.setScale(6, BigDecimal.ROUND_HALF_UP))
                 }
             }
+
+            // Accumulate energy on parent device
+            if (state.cumulativeEnergy == null) state.cumulativeEnergy = 0
+            state.cumulativeEnergy = (state.cumulativeEnergy as BigDecimal) + (combinedTotals / 1000)
+
             sendEvent(name: "power", value: combinedTotals)
-            sendEvent(name: "energy", value: combinedTotals / 1000)
+            sendEvent(name: "energy", value: state.cumulativeEnergy.setScale(6, BigDecimal.ROUND_HALF_UP))
             sendEvent(name: "lastUpdate", value: new Date().format("yyyy-MM-dd'T'HH:mm:ss'Z'"))
+
         } catch (e) {
             log.error "Error during refresh: ${e.message}"
         }
@@ -256,7 +345,7 @@ def fetchChild(name) {
     String thisId = device.id
     def cd = getChildDevice(name)
     if (!cd) {
-        cd = addChildDevice("hubitat", "Generic Component Power Meter", name, [name: name, isComponent: false])
+        cd = addChildDevice("ke7lvb", "Emporia Vue Child Device", name, [name: name, isComponent: false])
     }
     return cd
 }
