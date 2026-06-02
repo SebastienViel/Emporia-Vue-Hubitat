@@ -431,6 +431,8 @@ def refresh() {
                     def cd = fetchChild(stableId, label)
                     cd.sendEvent(name: "power", value: Wh)
 
+                    if (debugLog) log.debug "ENERGY CALC [${label}]: usageKwh=${usageKwh}, Wh=${Wh}, addingKwh=${Wh / 1000}"
+
                     // Accumulate energy: use Wh (already correctly scaled for the window)
                     // divided by 1000 to get kWh — only once per scale window
                     if (shouldAccumulateEnergy(stableId)) {
