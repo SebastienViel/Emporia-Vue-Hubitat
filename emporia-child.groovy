@@ -25,8 +25,8 @@ def uninstalled() {
 }
 
 def setEnergy(kWh) {
-    if (kWh == null || kWh < 0) {
-        log.error "setEnergy: invalid value '${kWh}' — must be a non-negative number"
+    if (kWh == null) {
+        log.error "setEnergy: invalid value — must be a number"
         return
     }
     def rounded = kWh.toBigDecimal().setScale(6, BigDecimal.ROUND_HALF_UP)
