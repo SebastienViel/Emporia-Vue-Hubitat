@@ -46,7 +46,7 @@ metadata {
     }
 }
 
-def version() { return "2.4.7" }
+def version() { return "2.4.8" }
 
 def installed() {
     if (logEnable) log.info "Driver installed"
@@ -391,7 +391,7 @@ def refresh() {
             cdFromGrid.sendEvent(name: "power", value: mainsFromGridWh)
             if (shouldAccumulateEnergy("MainsFromGrid")) {
                 def existingFromGrid = (cdFromGrid.getDataValue("cumulativeEnergy") ?: "0").toBigDecimal()
-                def newFromGrid = existingFromGrid + mainsFromGridKwh
+                def newFromGrid = existingFromGrid + (mainsFromGridWh / 1000)
                 cdFromGrid.updateDataValue("cumulativeEnergy", newFromGrid.toString())
                 cdFromGrid.sendEvent(name: "energy", value: newFromGrid.setScale(6, BigDecimal.ROUND_HALF_UP))
             }
@@ -401,7 +401,7 @@ def refresh() {
             cdToGrid.sendEvent(name: "power", value: mainsToGridWh)
             if (shouldAccumulateEnergy("MainsToGrid")) {
                 def existingToGrid = (cdToGrid.getDataValue("cumulativeEnergy") ?: "0").toBigDecimal()
-                def newToGrid = existingToGrid + mainsToGridKwh
+                def newToGrid = existingToGrid + (mainsToGridWh / 1000)
                 cdToGrid.updateDataValue("cumulativeEnergy", newToGrid.toString())
                 cdToGrid.sendEvent(name: "energy", value: newToGrid.setScale(6, BigDecimal.ROUND_HALF_UP))
             }
@@ -431,10 +431,11 @@ def refresh() {
                     def cd = fetchChild(stableId, label)
                     cd.sendEvent(name: "power", value: Wh)
 
-                    // Accumulate energy using raw kWh from API — only once per scale window
+                    // Accumulate energy: use Wh (already correctly scaled for the window)
+                    // divided by 1000 to get kWh — only once per scale window
                     if (shouldAccumulateEnergy(stableId)) {
                         def existingEnergy = (cd.getDataValue("cumulativeEnergy") ?: "0").toBigDecimal()
-                        def newEnergy = existingEnergy + usageKwh
+                        def newEnergy = existingEnergy + (Wh / 1000)
                         cd.updateDataValue("cumulativeEnergy", newEnergy.toString())
                         cd.sendEvent(name: "energy", value: newEnergy.setScale(6, BigDecimal.ROUND_HALF_UP))
                     }
@@ -444,8 +445,8 @@ def refresh() {
             // Accumulate energy on parent device
             if (state.cumulativeEnergy == null) state.cumulativeEnergy = 0
             if (shouldAccumulateEnergy("parent")) {
-                // Use TotalUsage kWh directly from API for parent accumulation
-                state.cumulativeEnergy = (state.cumulativeEnergy as BigDecimal) + totalUsageKwh
+                // Use combinedTotalsWh (already correctly scaled) / 1000 for kWh
+                state.cumulativeEnergy = (state.cumulativeEnergy as BigDecimal) + (combinedTotalsWh / 1000)
             }
 
             sendEvent(name: "power", value: combinedTotalsWh)
