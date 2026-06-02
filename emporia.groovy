@@ -46,7 +46,7 @@ metadata {
     }
 }
 
-def version() { return "2.4.6" }
+def version() { return "2.4.7" }
 
 def installed() {
     if (logEnable) log.info "Driver installed"
@@ -64,7 +64,6 @@ def uninstalled() {
 def updated() {
     if (logEnable) log.info "Settings updated"
 
-    // Schedule data refresh
     if (settings.refresh_interval != "0") {
         if (settings.refresh_interval == "60") {
             schedule("7 0 * ? * * *", refresh, [overwrite: true])
@@ -75,7 +74,6 @@ def updated() {
         unschedule(refresh)
     }
 
-    // Schedule daily reset if enabled
     if (settings.resetDaily) {
         schedule("0 0 0 * * ?", resetEnergyInternal, [overwrite: true])
         if (logEnable) log.info "Daily energy reset scheduled at midnight"
@@ -83,7 +81,6 @@ def updated() {
         unschedule(resetEnergyInternal)
     }
 
-    // Schedule token refresh 5 minutes before expiry
     if (state.tokenExpiry) {
         def refreshTime = (state.tokenExpiry - now() - 300000) / 1000
         runIn(refreshTime.toInteger(), refreshToken)
@@ -97,11 +94,48 @@ def updated() {
 }
 
 // ---------------------------------------------------------------------------
+// Returns the scale window duration in milliseconds.
+// This is used to prevent double-counting energy when the refresh interval
+// is shorter than the scale window.
+// ---------------------------------------------------------------------------
+def scaleWindowMs() {
+    switch (scale) {
+        case "1S":   return 1000L
+        case "1MIN": return 60000L
+        case "1H":   return 3600000L
+        case "1D":   return 86400000L
+        case "1W":   return 604800000L
+        case "1Mon": return 2592000000L  // ~30 days
+        case "1Y":   return 31536000000L // ~365 days
+        default:     return 3600000L
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Accumulate energy only if enough time has elapsed since the last
+// accumulation — i.e. at least one full scale window has passed.
+// This prevents double-counting when refresh_interval < scale window.
+// Returns the kWh to add (the raw API usage value) if accumulation should
+// happen, or 0 if we are still within the same scale window.
+// ---------------------------------------------------------------------------
+def shouldAccumulateEnergy(String deviceKey) {
+    def now = now()
+    def windowMs = scaleWindowMs()
+    def stateKey = "lastEnergyAccum_${deviceKey}"
+    def lastAccum = state[stateKey] ?: 0L
+
+    if ((now - lastAccum) >= windowMs) {
+        state[stateKey] = now
+        return true
+    }
+    return false
+}
+
+// ---------------------------------------------------------------------------
 // Migration: re-keys existing child devices from name-based IDs to
 // stable "GID_channelNum" IDs, preserving cumulative energy totals.
-// Special synthetic devices (MainsFromGrid, MainsToGrid) are left as-is
-// since they already use stable fixed names as their network IDs.
-// Run this command once after upgrading to v2.4.5.
+// Special synthetic devices (MainsFromGrid, MainsToGrid) are left as-is.
+// Run this command once after upgrading to v2.4.5+.
 // ---------------------------------------------------------------------------
 def migrateChildDevices(forceDeleteDuplicates) {
     if (logEnable) log.info "Starting child device migration to stable network IDs"
@@ -111,23 +145,16 @@ def migrateChildDevices(forceDeleteDuplicates) {
     try {
         def response = httpGet([uri: "${host}${command}", headers: ['authtoken': state.idToken]]) { resp -> resp.data }
 
-        // Build a map of channelName -> stableId from the API
-        // stableId format: "<deviceGid>_<channelNum>"
         def nameToStableId = [:]
-        def nameToLabel    = [:]
 
         response.devices.each { value ->
             if (value.devices && value.devices.size() > 0) {
                 value.devices[0].channels.each { ch ->
                     if (ch.name) {
-                        def stableId = "${ch.deviceGid}_${ch.channelNum}"
-                        nameToStableId[ch.name] = stableId
-                        nameToLabel[ch.name]    = ch.name
+                        nameToStableId[ch.name] = "${ch.deviceGid}_${ch.channelNum}"
                     }
                 }
             }
-            // Also map the synthetic Main/TotalUsage/Balance channel names
-            // which are currently stored as "Main_GID", "TotalUsage_GID", "Balance_GID"
             def gid = value.deviceGid
             nameToStableId["Main_${gid}"]       = "${gid}_Main"
             nameToStableId["TotalUsage_${gid}"] = "${gid}_TotalUsage"
@@ -140,14 +167,12 @@ def migrateChildDevices(forceDeleteDuplicates) {
         getChildDevices().each { cd ->
             def oldNetId = cd.deviceNetworkId
 
-            // Skip already-migrated or synthetic fixed-name devices
             if (oldNetId == "MainsFromGrid" || oldNetId == "MainsToGrid") {
                 if (logEnable) log.info "Skipping synthetic device: ${oldNetId}"
                 skipped++
                 return
             }
 
-            // Skip if already in stable format (contains underscore followed by digits or keyword)
             if (oldNetId ==~ /\d+_.+/) {
                 if (logEnable) log.info "Already migrated, skipping: ${oldNetId}"
                 skipped++
@@ -156,10 +181,7 @@ def migrateChildDevices(forceDeleteDuplicates) {
 
             def newNetId = nameToStableId[oldNetId]
             if (newNetId) {
-                // Preserve cumulative energy before migration
                 def savedEnergy = cd.getDataValue("cumulativeEnergy") ?: "0"
-
-                // Check if a device with the new ID already exists
                 def existing = getChildDevice(newNetId)
                 if (existing) {
                     if (forceDeleteDuplicates == "Yes - delete old device if stable ID already exists") {
@@ -173,17 +195,11 @@ def migrateChildDevices(forceDeleteDuplicates) {
                     return
                 }
 
-                // Create new child with stable ID, preserving the label
                 def newLabel = cd.label ?: cd.name ?: oldNetId
                 def newCd = addChildDevice("ke7lvb", "Emporia Vue Child Device", newNetId, [name: newNetId, label: newLabel, isComponent: false])
-
-                // Restore cumulative energy on new device
                 newCd.updateDataValue("cumulativeEnergy", savedEnergy)
                 newCd.sendEvent(name: "energy", value: savedEnergy.toBigDecimal().setScale(6, BigDecimal.ROUND_HALF_UP))
-
-                // Delete the old child device
                 deleteChildDevice(oldNetId)
-
                 if (logEnable) log.info "Migrated: '${oldNetId}' -> '${newNetId}' (label: ${newLabel}, energy preserved: ${savedEnergy})"
                 migrated++
             } else {
@@ -212,6 +228,8 @@ def resetEnergyInternal() {
     if (logEnable) log.info "Resetting all cumulative energy totals"
     state.cumulativeEnergy = 0
     sendEvent(name: "energy", value: 0)
+    // Also clear all lastEnergyAccum timestamps so accumulation restarts cleanly
+    state.keySet().findAll { it.startsWith("lastEnergyAccum_") }.each { state.remove(it) }
     getChildDevices().each { cd ->
         cd.sendEvent(name: "energy", value: 0)
         cd.updateDataValue("cumulativeEnergy", "0")
@@ -341,45 +359,52 @@ def refresh() {
                 state.JSON = JsonOutput.toJson(JSON)
             }
             def devices = JSON.deviceListUsages.devices
-            def combinedTotals = 0
+            def combinedTotalsWh = 0
 
             // --- First pass: collect TotalUsage and Solar to compute grid flow ---
-            def totalUsageWh = 0
-            def solarWh = 0
+            def totalUsageKwh = 0
+            def solarKwh = 0
             def solarName = settings.solarChannelName ?: "Rooftop Solar Panels"
 
             devices.each { value ->
                 value.channelUsages.each { next_value ->
-                    def name = next_value.name
-                    def usage = next_value.usage ?: 0
-                    def Wh = convertToWh(usage)
-                    if (name == "TotalUsage") { totalUsageWh += Wh }
-                    if (name == solarName)    { solarWh += Wh }
+                    def name  = next_value.name
+                    // usage is the raw kWh value from the API for the scale window
+                    def usage = (next_value.usage ?: 0) as BigDecimal
+                    if (name == "TotalUsage") { totalUsageKwh += usage }
+                    if (name == solarName)    { solarKwh += usage }
                 }
             }
 
-            // MainsFromGrid = energy drawn from grid  = max(0, TotalUsage - Solar)
-            // MainsToGrid   = energy exported to grid = max(0, Solar - TotalUsage)
-            def mainsFromGridWh = Math.max(0, totalUsageWh - solarWh)
-            def mainsToGridWh   = Math.max(0, solarWh - totalUsageWh)
+            // Power values for MainsFromGrid/ToGrid (convert raw kWh to Wh for power display)
+            def mainsFromGridWh = Math.max(0, convertToWh(totalUsageKwh / 1000) - convertToWh(solarKwh / 1000))
+            def mainsToGridWh   = Math.max(0, convertToWh(solarKwh / 1000) - convertToWh(totalUsageKwh / 1000))
 
-            if (debugLog) log.debug "TotalUsage: ${totalUsageWh} Wh | Solar: ${solarWh} Wh | FromGrid: ${mainsFromGridWh} Wh | ToGrid: ${mainsToGridWh} Wh"
+            // Energy values for MainsFromGrid/ToGrid — raw kWh from API, no double conversion
+            def mainsFromGridKwh = (totalUsageKwh - solarKwh).max(0)
+            def mainsToGridKwh   = (solarKwh - totalUsageKwh).max(0)
 
-            // Update MainsFromGrid child (fixed name as stable network ID)
+            if (debugLog) log.debug "TotalUsage: ${totalUsageKwh} kWh | Solar: ${solarKwh} kWh | FromGrid: ${mainsFromGridKwh} kWh | ToGrid: ${mainsToGridKwh} kWh"
+
+            // Update MainsFromGrid child
             def cdFromGrid = fetchChild("MainsFromGrid", "MainsFromGrid")
             cdFromGrid.sendEvent(name: "power", value: mainsFromGridWh)
-            def existingFromGrid = (cdFromGrid.getDataValue("cumulativeEnergy") ?: "0").toBigDecimal()
-            def newFromGrid = existingFromGrid + (mainsFromGridWh / 1000)
-            cdFromGrid.updateDataValue("cumulativeEnergy", newFromGrid.toString())
-            cdFromGrid.sendEvent(name: "energy", value: newFromGrid.setScale(6, BigDecimal.ROUND_HALF_UP))
+            if (shouldAccumulateEnergy("MainsFromGrid")) {
+                def existingFromGrid = (cdFromGrid.getDataValue("cumulativeEnergy") ?: "0").toBigDecimal()
+                def newFromGrid = existingFromGrid + mainsFromGridKwh
+                cdFromGrid.updateDataValue("cumulativeEnergy", newFromGrid.toString())
+                cdFromGrid.sendEvent(name: "energy", value: newFromGrid.setScale(6, BigDecimal.ROUND_HALF_UP))
+            }
 
-            // Update MainsToGrid child (fixed name as stable network ID)
+            // Update MainsToGrid child
             def cdToGrid = fetchChild("MainsToGrid", "MainsToGrid")
             cdToGrid.sendEvent(name: "power", value: mainsToGridWh)
-            def existingToGrid = (cdToGrid.getDataValue("cumulativeEnergy") ?: "0").toBigDecimal()
-            def newToGrid = existingToGrid + (mainsToGridWh / 1000)
-            cdToGrid.updateDataValue("cumulativeEnergy", newToGrid.toString())
-            cdToGrid.sendEvent(name: "energy", value: newToGrid.setScale(6, BigDecimal.ROUND_HALF_UP))
+            if (shouldAccumulateEnergy("MainsToGrid")) {
+                def existingToGrid = (cdToGrid.getDataValue("cumulativeEnergy") ?: "0").toBigDecimal()
+                def newToGrid = existingToGrid + mainsToGridKwh
+                cdToGrid.updateDataValue("cumulativeEnergy", newToGrid.toString())
+                cdToGrid.sendEvent(name: "energy", value: newToGrid.setScale(6, BigDecimal.ROUND_HALF_UP))
+            }
 
             // --- Second pass: update all channel child devices ---
             devices.each { value ->
@@ -388,18 +413,16 @@ def refresh() {
                     def channelName = next_value.name
                     def gid         = next_value.deviceGid
                     def channelNum  = next_value.channelNum
-                    def usage       = next_value.usage ?: 0
-                    def Wh          = convertToWh(usage)
-                    def kWh         = Wh / 1000
+                    // usage is raw kWh from the API for the scale window
+                    def usageKwh    = (next_value.usage ?: 0) as BigDecimal
+                    // Power = convert raw kWh back to instantaneous Wh equivalent
+                    def Wh          = convertToWh(usageKwh)
 
                     if (channelName == "Main") {
-                        combinedTotals += Wh
+                        combinedTotalsWh += Wh
                     }
 
-                    // Stable network ID = "<gid>_<channelNum>"
                     def stableId = "${gid}_${channelNum}"
-
-                    // Human-readable label
                     def label = channelName
                     if (channelName == "Main" || channelName == "TotalUsage" || channelName == "Balance") {
                         label = "${channelName}_${gid}"
@@ -408,19 +431,25 @@ def refresh() {
                     def cd = fetchChild(stableId, label)
                     cd.sendEvent(name: "power", value: Wh)
 
-                    def existingEnergy = (cd.getDataValue("cumulativeEnergy") ?: "0").toBigDecimal()
-                    def newEnergy = existingEnergy + kWh
-                    cd.updateDataValue("cumulativeEnergy", newEnergy.toString())
-                    cd.sendEvent(name: "energy", value: newEnergy.setScale(6, BigDecimal.ROUND_HALF_UP))
+                    // Accumulate energy using raw kWh from API — only once per scale window
+                    if (shouldAccumulateEnergy(stableId)) {
+                        def existingEnergy = (cd.getDataValue("cumulativeEnergy") ?: "0").toBigDecimal()
+                        def newEnergy = existingEnergy + usageKwh
+                        cd.updateDataValue("cumulativeEnergy", newEnergy.toString())
+                        cd.sendEvent(name: "energy", value: newEnergy.setScale(6, BigDecimal.ROUND_HALF_UP))
+                    }
                 }
             }
 
             // Accumulate energy on parent device
             if (state.cumulativeEnergy == null) state.cumulativeEnergy = 0
-            state.cumulativeEnergy = (state.cumulativeEnergy as BigDecimal) + (combinedTotals / 1000)
+            if (shouldAccumulateEnergy("parent")) {
+                // Use TotalUsage kWh directly from API for parent accumulation
+                state.cumulativeEnergy = (state.cumulativeEnergy as BigDecimal) + totalUsageKwh
+            }
 
-            sendEvent(name: "power", value: combinedTotals)
-            sendEvent(name: "energy", value: state.cumulativeEnergy.setScale(6, BigDecimal.ROUND_HALF_UP))
+            sendEvent(name: "power", value: combinedTotalsWh)
+            sendEvent(name: "energy", value: (state.cumulativeEnergy as BigDecimal).setScale(6, BigDecimal.ROUND_HALF_UP))
             sendEvent(name: "lastUpdate", value: new Date().format("yyyy-MM-dd'T'HH:mm:ss'Z'"))
 
         } catch (e) {
@@ -437,30 +466,39 @@ def authToken(token) {
     state.lastTokenUpdate = timeToday(now)
 }
 
-def convertToWh(usage) {
-    if (usage != null) {
+// ---------------------------------------------------------------------------
+// convertToWh: converts the raw API kWh usage value into an instantaneous
+// power representation in Wh, scaled to a per-hour rate.
+// The API returns kWh consumed over the scale window. To get an approximate
+// instantaneous power (Wh), we extrapolate to an hourly rate:
+//   1S   → usage was per-second  → multiply by 3600 to get Wh/h
+//   1MIN → usage was per-minute  → multiply by 60   to get Wh/h
+//   1H+  → usage already in kWh/h window → multiply by 1000 to get Wh
+// Note: usageKwh here is already in kWh (raw from API, NOT pre-multiplied).
+// ---------------------------------------------------------------------------
+def convertToWh(usageKwh) {
+    if (usageKwh != null) {
         switch (scale) {
             case "1S":
-                return Math.round(usage * 60 * 60 * 1000)
+                return Math.round(usageKwh * 1000 * 3600)
             case "1MIN":
-                return Math.round(usage * 60 * 1000)
+                return Math.round(usageKwh * 1000 * 60)
             default:
-                return Math.round(usage * 1000)
+                return Math.round(usageKwh * 1000)
         }
     }
     return 0
 }
 
-// fetchChild now takes a stable networkId and a human-readable label separately.
-// If the label changes (Emporia rename), the network ID stays the same and only
-// the Hubitat device label is updated — no new device is created.
+// fetchChild: uses a stable networkId as the device key and a separate
+// human-readable label. If the label changes (circuit renamed in Emporia),
+// only the label is updated — the device itself is never recreated.
 def fetchChild(String networkId, String label) {
     def cd = getChildDevice(networkId)
     if (!cd) {
         cd = addChildDevice("ke7lvb", "Emporia Vue Child Device", networkId, [name: networkId, label: label, isComponent: false])
         if (logEnable) log.info "Created child device: ${label} (${networkId})"
     } else if (cd.label != label) {
-        // Name changed in Emporia app — update the label without recreating the device
         cd.setLabel(label)
         if (logEnable) log.info "Updated label for ${networkId}: '${cd.label}' -> '${label}'"
     }
