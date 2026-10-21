@@ -46,7 +46,7 @@ metadata {
     }
 }
 
-def version() { return "2.4.9" }
+def version() { return "2.4.10" }
 
 def installed() {
     if (logEnable) log.info "Driver installed"
@@ -112,23 +112,29 @@ def scaleWindowMs() {
 }
 
 // ---------------------------------------------------------------------------
-// Accumulate energy only if enough time has elapsed since the last
-// accumulation — i.e. at least one full scale window has passed.
-// This prevents double-counting when refresh_interval < scale window.
-// Returns the kWh to add (the raw API usage value) if accumulation should
-// happen, or 0 if we are still within the same scale window.
+// energyFactor: fraction of the scale window that has elapsed since the last
+// refresh (capped at 1.0). The API returns kWh consumed over a window of
+// length "scale" ending at the request instant. Multiplying that value by
+// (elapsed / window) and summing it on every refresh gives the correct total
+// for any refresh interval <= the scale window, and never skips a refresh
+// because of scheduler timing jitter (the old 1-hour gate did).
 // ---------------------------------------------------------------------------
-def shouldAccumulateEnergy(String deviceKey) {
-    def now = now()
-    def windowMs = scaleWindowMs()
-    def stateKey = "lastEnergyAccum_${deviceKey}"
-    def lastAccum = state[stateKey] ?: 0L
+def energyFactor() {
+    Long nowMs = now()
+    Long windowMs = scaleWindowMs()
+    Long last = (state.lastEnergySampleMs ?: 0) as Long
+    state.lastEnergySampleMs = nowMs
 
-    if ((now - lastAccum) >= windowMs) {
-        state[stateKey] = now
-        return true
+    Long elapsed
+    if (last > 0) {
+        elapsed = nowMs - last
+    } else {
+        // first sample: assume one refresh interval
+        Integer mins = (settings.refresh_interval ?: "60") as Integer
+        elapsed = (mins > 0) ? mins * 60000L : windowMs
     }
-    return false
+    if (elapsed > windowMs) elapsed = windowMs
+    return elapsed.toBigDecimal() / windowMs.toBigDecimal()
 }
 
 // ---------------------------------------------------------------------------
@@ -359,6 +365,8 @@ def refresh() {
                 state.JSON = JsonOutput.toJson(JSON)
             }
             def devices = JSON.deviceListUsages.devices
+            def accumFactor = energyFactor()
+            if (debugLog) log.debug "Energy accumulation factor: ${accumFactor}"
             def combinedTotalsWh = 0
 
             // --- First pass: collect TotalUsage and Solar to compute grid flow ---
@@ -377,8 +385,8 @@ def refresh() {
             }
 
             // Power values for MainsFromGrid/ToGrid (convert raw kWh to Wh for power display)
-            def mainsFromGridWh = Math.max(0, convertToWh(totalUsageKwh / 1000) - convertToWh(solarKwh / 1000))
-            def mainsToGridWh   = Math.max(0, convertToWh(solarKwh / 1000) - convertToWh(totalUsageKwh / 1000))
+            def mainsFromGridWh = Math.max(0, convertToWh(totalUsageKwh) - convertToWh(solarKwh))
+            def mainsToGridWh   = Math.max(0, convertToWh(solarKwh) - convertToWh(totalUsageKwh))
 
             // Energy values for MainsFromGrid/ToGrid — raw kWh from API, no double conversion
             def mainsFromGridKwh = (totalUsageKwh - solarKwh).max(0)
@@ -389,9 +397,9 @@ def refresh() {
             // Update MainsFromGrid child
             def cdFromGrid = fetchChild("MainsFromGrid", "MainsFromGrid")
             cdFromGrid.sendEvent(name: "power", value: mainsFromGridWh)
-            if (shouldAccumulateEnergy("MainsFromGrid")) {
+            if (accumFactor > 0) {
                 def existingFromGrid = (cdFromGrid.getDataValue("cumulativeEnergy") ?: "0").toBigDecimal()
-                def newFromGrid = existingFromGrid + mainsFromGridKwh
+                def newFromGrid = existingFromGrid + (mainsFromGridKwh * accumFactor)
                 cdFromGrid.updateDataValue("cumulativeEnergy", newFromGrid.toString())
                 cdFromGrid.sendEvent(name: "energy", value: newFromGrid.setScale(6, BigDecimal.ROUND_HALF_UP))
             }
@@ -399,9 +407,9 @@ def refresh() {
             // Update MainsToGrid child
             def cdToGrid = fetchChild("MainsToGrid", "MainsToGrid")
             cdToGrid.sendEvent(name: "power", value: mainsToGridWh)
-            if (shouldAccumulateEnergy("MainsToGrid")) {
+            if (accumFactor > 0) {
                 def existingToGrid = (cdToGrid.getDataValue("cumulativeEnergy") ?: "0").toBigDecimal()
-                def newToGrid = existingToGrid + mainsToGridKwh
+                def newToGrid = existingToGrid + (mainsToGridKwh * accumFactor)
                 cdToGrid.updateDataValue("cumulativeEnergy", newToGrid.toString())
                 cdToGrid.sendEvent(name: "energy", value: newToGrid.setScale(6, BigDecimal.ROUND_HALF_UP))
             }
@@ -433,9 +441,9 @@ def refresh() {
 
                     // Accumulate energy using raw API usage value (already in kWh for the scale window)
                     // Do NOT use Wh/1000 — Wh is extrapolated to per-hour rate for power display only
-                    if (shouldAccumulateEnergy(stableId)) {
+                    if (accumFactor > 0) {
                         def existingEnergy = (cd.getDataValue("cumulativeEnergy") ?: "0").toBigDecimal()
-                        def newEnergy = existingEnergy + usageKwh
+                        def newEnergy = existingEnergy + (usageKwh * accumFactor)
                         cd.updateDataValue("cumulativeEnergy", newEnergy.toString())
                         cd.sendEvent(name: "energy", value: newEnergy.setScale(6, BigDecimal.ROUND_HALF_UP))
                     }
@@ -444,9 +452,9 @@ def refresh() {
 
             // Accumulate energy on parent device
             if (state.cumulativeEnergy == null) state.cumulativeEnergy = 0
-            if (shouldAccumulateEnergy("parent")) {
+            if (accumFactor > 0) {
                 // Use TotalUsage raw kWh directly from API
-                state.cumulativeEnergy = (state.cumulativeEnergy as BigDecimal) + totalUsageKwh
+                state.cumulativeEnergy = (state.cumulativeEnergy as BigDecimal) + (totalUsageKwh * accumFactor)
             }
 
             sendEvent(name: "power", value: combinedTotalsWh)
